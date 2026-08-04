@@ -1,0 +1,8 @@
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+node_modules/
