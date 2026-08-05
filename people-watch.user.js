@@ -79,7 +79,9 @@
     DEFAULT_ARM_HOURS: 24,
     HOTKEY: 'p',                // Alt+P toggles the panel
     PANEL_W: 560,
-    EDGE: 8,
+    PANEL_MIN_H: 160,
+    FAB_SIZE: 38,
+    EDGE: 8,                    // keep this much gap from the viewport edge
   };
 
   const K = {
@@ -103,7 +105,7 @@
   /** @type {Record<string, any>} username -> observed profile */
   let people = readJSON(K.people, {});
   let roster = readJSON(K.roster, { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} });
-  let ui = readJSON(K.ui, { arm: null, sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false });
+  let ui = readJSON(K.ui, { arm: null, sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null });
 
   let saveTimer = null;
   const save = () => {
@@ -495,8 +497,10 @@
     .never { color: #fbbf24; }
     .dim { color: #71717a; }
     .note { padding: 6px 8px; color: #a1a1aa; border-top: 1px solid #27272a; font-size: 11px; }
-    .fab { position: fixed; z-index: 2147483000; width: 38px; height: 38px; background: #09090b;
-      border: 1px solid #3f3f46; color: #e4e4e7; cursor: pointer; font-size: 11px; }
+    .fab { position: fixed; z-index: 2147483000; width: ${CFG.FAB_SIZE}px; height: ${CFG.FAB_SIZE}px;
+      background: #09090b; border: 1px solid #3f3f46; color: #e4e4e7; font-size: 11px;
+      cursor: grab; touch-action: none; }
+    .fab.dragging { cursor: grabbing; border-color: #71717a; }
   `;
 
   function mount() {
@@ -512,17 +516,135 @@
     fab = document.createElement('button');
     fab.className = 'fab';
     fab.textContent = 'PPL';
-    fab.style.right = CFG.EDGE + 'px';
-    fab.style.bottom = CFG.EDGE + 'px';
-    fab.onclick = () => { ui.open = !ui.open; save(); paint(); };
+    fab.title = 'People Watch — click to open, drag to move, double-click to reset';
     root.append(fab);
 
     const panel = document.createElement('div');
     panel.className = 'panel';
-    panel.style.right = CFG.EDGE + 'px';
-    panel.style.bottom = (CFG.EDGE + 46) + 'px';
     root.append(panel);
+
+    placeFab();
+    makeDraggable();
+    window.addEventListener('resize', placeFab);
     paint();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Placement — the button is draggable and the position is remembered, because
+  // the game's own furniture (the chat dock) owns the bottom-right corner and
+  // there is no arrangement that is right for every layout. The panel hangs off
+  // whichever side of the button has room, so it can't end up off-screen.
+  // ---------------------------------------------------------------------------
+  const defaultFabPos = () => ({
+    x: window.innerWidth - CFG.FAB_SIZE - CFG.EDGE,
+    y: Math.round((window.innerHeight - CFG.FAB_SIZE) / 2),
+  });
+
+  const clampFab = ({ x, y }) => ({
+    x: Math.min(Math.max(x, CFG.EDGE), Math.max(CFG.EDGE, window.innerWidth - CFG.FAB_SIZE - CFG.EDGE)),
+    y: Math.min(Math.max(y, CFG.EDGE), Math.max(CFG.EDGE, window.innerHeight - CFG.FAB_SIZE - CFG.EDGE)),
+  });
+
+  /**
+   * A hidden tab or a minimised window can report a ~zero viewport. Clamping
+   * against that pins everything into the top-left corner and the next save
+   * makes it permanent, so treat it as "no information" and leave the stored
+   * position alone until real dimensions come back.
+   */
+  const viewportUsable = () => window.innerWidth > 120 && window.innerHeight > 120;
+
+  function placeFab() {
+    if (!fab || !viewportUsable()) return;
+    ui.fab = clampFab(ui.fab || defaultFabPos());
+    Object.assign(fab.style, {
+      left: `${ui.fab.x}px`, top: `${ui.fab.y}px`, right: 'auto', bottom: 'auto',
+    });
+    placePanel();
+  }
+
+  // Which side of the button the panel is currently hanging off. Sticky, so it
+  // doesn't flip back and forth while the button is being dragged along an edge.
+  let panelAlign = 'right';
+
+  function placePanel() {
+    const panel = root && root.querySelector('.panel');
+    if (!panel || !ui.fab || !viewportUsable()) return;
+    const { x, y } = ui.fab;
+    const gap = 8;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const w = Math.min(CFG.PANEL_W, vw - CFG.EDGE * 2);
+    panel.style.width = `${w}px`;
+
+    // Horizontal: whichever edge of the button leaves the panel fully on screen,
+    // preferring right-aligned so it opens inward from the right.
+    const rightAligned = x + CFG.FAB_SIZE - w;
+    const leftAligned = x;
+    const fits = (l) => l >= CFG.EDGE && l + w <= vw - CFG.EDGE;
+
+    let left;
+    if (panelAlign === 'left' && fits(leftAligned)) left = leftAligned;
+    else if (fits(rightAligned)) { left = rightAligned; panelAlign = 'right'; }
+    else if (fits(leftAligned)) { left = leftAligned; panelAlign = 'left'; }
+    else { left = rightAligned; panelAlign = 'right'; }
+    panel.style.left = `${Math.max(CFG.EDGE, Math.min(left, vw - w - CFG.EDGE))}px`;
+    panel.style.right = 'auto';
+
+    // Vertical: whichever side of the button has more room, capped to exactly
+    // that much so the table scrolls instead of overflowing the viewport.
+    const above = y - gap - CFG.EDGE;
+    const below = vh - (y + CFG.FAB_SIZE) - gap - CFG.EDGE;
+    if (above >= below) {
+      panel.style.bottom = `${vh - y + gap}px`;
+      panel.style.top = 'auto';
+    } else {
+      panel.style.top = `${y + CFG.FAB_SIZE + gap}px`;
+      panel.style.bottom = 'auto';
+    }
+    panel.style.maxHeight = `${Math.max(CFG.PANEL_MIN_H, Math.max(above, below))}px`;
+  }
+
+  function makeDraggable() {
+    let drag = null;
+    let suppressClick = false;
+
+    fab.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      const p = ui.fab || (ui.fab = clampFab(defaultFabPos()));
+      drag = { dx: e.clientX - p.x, dy: e.clientY - p.y, id: e.pointerId, moved: false };
+      try { fab.setPointerCapture(e.pointerId); } catch { /* capture is optional */ }
+      e.preventDefault();
+    });
+
+    fab.addEventListener('pointermove', (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const nx = e.clientX - drag.dx, ny = e.clientY - drag.dy;
+      // A few px of slop, so a slightly shaky click still counts as a click.
+      if (!drag.moved && Math.hypot(nx - ui.fab.x, ny - ui.fab.y) < 4) return;
+      if (!drag.moved) { drag.moved = true; fab.classList.add('dragging'); }
+      ui.fab = clampFab({ x: nx, y: ny });
+      placeFab();
+    });
+
+    const end = (e) => {
+      if (!drag || (e.pointerId != null && e.pointerId !== drag.id)) return;
+      const moved = drag.moved;
+      drag = null;
+      fab.classList.remove('dragging');
+      try { fab.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+      if (moved) { suppressClick = true; save(); }
+    };
+    fab.addEventListener('pointerup', end);
+    fab.addEventListener('pointercancel', end);
+
+    // Click still drives the toggle, so the keyboard path keeps working; a drag
+    // just swallows the click that follows it.
+    fab.onclick = () => {
+      if (suppressClick) { suppressClick = false; return; }
+      ui.open = !ui.open; save(); paint();
+    };
+
+    // Double-click returns it to the default spot if it ever gets lost.
+    fab.ondblclick = () => { ui.fab = defaultFabPos(); save(); placeFab(); };
   }
 
   function paint() {
@@ -650,6 +772,7 @@
     queue: () => buildQueue(),
     rows,
     stop: () => { clearTimeout(nextTimer); ui.arm = null; saveNow(); paint(); return 'stopped'; },
+    resetFab: () => { ui.fab = defaultFabPos(); saveNow(); placeFab(); return ui.fab; },
     clear: () => { people = {}; roster = { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} }; saveNow(); paint(); return 'cleared'; },
     export: () => JSON.stringify({ people, roster }, null, 2),
   };

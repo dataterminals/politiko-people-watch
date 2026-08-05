@@ -49,10 +49,17 @@ installing.
 
 ```bash
 node tools/test-people.js
+node tools/test-placement.js
 ```
 
-Exercises the backfill queue and metric layers against synthetic ledger state. The queue
+`test-people` exercises the backfill queue and metric layers against synthetic ledger state. The queue
 decides how many requests get originated against a live account, so it is the part worth
 pinning down: it must not re-serve a job that already landed, must not spin on one that
-never will, and must go quiet once everything is fresh. The test slices those layers
-straight out of the shipped script so it cannot drift from the source.
+never will, and must go quiet once everything is fresh.
+
+`test-placement` exercises the panel placement layer against a synthetic viewport: the
+button stays on screen, and the panel stays fully visible from whichever corner the button
+was dragged into.
+
+Both slice their layers straight out of the shipped script, so they cannot drift from the
+source.
