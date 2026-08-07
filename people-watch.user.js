@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Politiko — People Watch
 // @namespace    https://github.com/dataterminals/politiko-people-watch
-// @version      0.2.0
+// @version      0.3.0
 // @description  Builds a local ledger of players' last-online times, ranks and combat records, and sorts it least-active-first. Reads profiles the app fetches on its own; when explicitly armed, ORIGINATES paced requests to /api/people and /api/users/{name} to fill the gaps.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/politiko-people-watch
@@ -80,7 +80,7 @@
     HOTKEY: 'p',                // Alt+P toggles the panel
     PANEL_W: 560,
     PANEL_MIN_H: 160,
-    FAB_SIZE: 38,
+    FAB_SIZE: 42,           // a triangle carries less visual weight than a square of the same box
     EDGE: 8,                    // keep this much gap from the viewport edge
   };
 
@@ -609,31 +609,41 @@
     .never { color: #fbbf24; }
     .dim { color: #71717a; }
     .note { padding: 6px 8px; color: #a1a1aa; border-top: 1px solid #27272a; font-size: 11px; }
+    /* The button is the triangle — not a square with a triangle drawn on it. The
+       outline and fill come from the SVG, and clip-path takes the corners out of the
+       box itself, so the hit area is the triangle too: clicks in the dead corners
+       fall through to whatever is underneath. */
     .fab { position: fixed; z-index: 2147483000; width: ${CFG.FAB_SIZE}px; height: ${CFG.FAB_SIZE}px;
-      background: #09090b; border: 1px solid #3f3f46; color: #e4e4e7; font-size: 11px;
-      cursor: grab; touch-action: none; padding: 0;
-      display: flex; align-items: center; justify-content: center; }
-    .fab svg { width: 22px; height: 22px; display: block; }
-    .fab.dragging { cursor: grabbing; border-color: #71717a; }
+      background: none; border: 0; padding: 0; color: #e4e4e7;
+      cursor: grab; touch-action: none; display: block;
+      clip-path: polygon(50% 0%, 100% 100%, 0% 100%); }
+    .fab svg { width: 100%; height: 100%; display: block; }
+    .fab:hover { color: #fafafa; }
+    .fab.dragging { cursor: grabbing; color: #a1a1aa; }
     .grip { display: flex; gap: 8px; align-items: baseline; padding: 6px 8px;
       border-bottom: 1px solid #27272a; user-select: none; }
     .grip b { font-weight: 600; letter-spacing: .04em; }
     .grip .cov { margin-left: auto; }
   `;
 
-  // The eye of providence: a triangle, a lens, a pupil. Drawn rather than typed so it
-  // stays legible at 22px — glyph fallbacks for this are a lottery across platforms.
+  // The eye of providence. The triangle carries the button's own fill and outline and
+  // runs to the edge of the box, inset just enough that its stroke survives the
+  // clip-path rather than being sliced in half along the diagonals.
   const EYE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-      <path d="M12 2.6 22 20.4 2 20.4 Z"/>
-      <path d="M6.9 14.6c1.6-2.7 8.6-2.7 10.2 0-1.6 2.7-8.6 2.7-10.2 0Z"/>
-      <circle cx="12" cy="14.6" r="1.5" fill="currentColor" stroke="none"/>
+      stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M12 2 22.6 22.2 1.4 22.2 Z" fill="#09090b"/>
+      <path d="M7.3 16.5c1.5-2.6 7.9-2.6 9.4 0-1.5 2.6-7.9 2.6-9.4 0Z"/>
+      <circle cx="12" cy="16.5" r="1.45" fill="currentColor" stroke="none"/>
     </svg>`;
 
   function mount() {
     if (host) return;
     host = document.createElement('div');
-    host.style.cssText = 'position:fixed;inset:0;width:0;height:0;';
+    // The host must carry the z-index, not just the children. position:fixed makes it a
+    // stacking context, so the huge z-indexes inside are only ever resolved against each
+    // other — left on `auto` the whole shadow tree sits below the game's Comms dock
+    // (z-index 9999) and clicks on the overlap land on chat instead of on us.
+    host.style.cssText = 'position:fixed;inset:0;width:0;height:0;z-index:2147483000;';
     root = host.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
     style.textContent = css;
@@ -677,9 +687,12 @@
   // there is no arrangement that is right for every layout. The panel hangs off
   // whichever side of the button has room, so it can't end up off-screen.
   // ---------------------------------------------------------------------------
+  // Right edge, but in the upper third rather than dead centre: the Comms dock is
+  // 420px tall and anchored to the bottom of the same edge, so a vertically centred
+  // button lands on top of it on any window shorter than ~840px.
   const defaultFabPos = () => ({
     x: window.innerWidth - CFG.FAB_SIZE - CFG.EDGE,
-    y: Math.round((window.innerHeight - CFG.FAB_SIZE) / 2),
+    y: Math.round(window.innerHeight * 0.28),
   });
 
   const clampFab = ({ x, y }) => ({
