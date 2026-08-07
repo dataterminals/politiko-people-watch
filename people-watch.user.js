@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Politiko — People Watch
 // @namespace    https://github.com/dataterminals/politiko-people-watch
-// @version      0.3.0
+// @version      0.4.0
 // @description  Builds a local ledger of players' last-online times, ranks and combat records, and sorts it least-active-first. Reads profiles the app fetches on its own; when explicitly armed, ORIGINATES paced requests to /api/people and /api/users/{name} to fill the gaps.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/politiko-people-watch
@@ -26,6 +26,11 @@
  *
  *   Requests: ZERO while disarmed — the default on every load. Arming is a deliberate
  *             act with an expiry, and survives reload only until that expiry.
+ *
+ *             Clicking a name in the panel is navigation, not a request this script
+ *             originates: it performs the same client-side route change as clicking
+ *             that player anywhere else in the game, and the app then fetches the
+ *             profile as it always would — only because you clicked.
  *
  *             WHEN ARMED IN 'live' MODE THIS SCRIPT ORIGINATES REQUESTS:
  *               GET /api/people?page=N   — up to `total_pages` (30 at time of writing)
@@ -605,6 +610,9 @@
     th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #18181b; white-space: nowrap; }
     th { position: sticky; top: 0; background: #09090b; color: #a1a1aa; font-weight: 500; font-size: 11px; }
     tr:hover td { background: #18181b; }
+    a.plink { color: inherit; text-decoration: none; cursor: pointer;
+      border-bottom: 1px dotted #3f3f46; }
+    a.plink:hover { color: #fafafa; border-bottom-color: #a1a1aa; }
     .idle { color: #f87171; }
     .never { color: #fbbf24; }
     .dim { color: #71717a; }
@@ -815,6 +823,32 @@
     fab.ondblclick = () => { ui.fab = defaultFabPos(); save(); placeFab(); };
   }
 
+  /**
+   * A real <a href>, so middle-click and ctrl-click open a tab the way they should and
+   * the browser shows the destination on hover. A plain left click is intercepted and
+   * turned into the SPA route change instead, because a full page load would throw away
+   * the whole session's in-memory state for no reason.
+   *
+   * This is navigation, not a request we originate: it is the same thing clicking that
+   * player anywhere else in the game does. The app fetches the profile itself, exactly
+   * as it always would, and the tap ingests that response like any other.
+   */
+  const profileLink = (username) => {
+    const a = document.createElement('a');
+    a.className = 'plink';
+    a.textContent = username;
+    a.href = `/profile/${encodeURIComponent(username)}`;
+    a.title = `open @${username}'s profile`;
+    a.addEventListener('click', (e) => {
+      // let the browser handle anything that isn't a plain left click
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      history.pushState({}, '', a.getAttribute('href'));
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+    return a;
+  };
+
   function paint() {
     if (!root) return;
     const panel = root.querySelector('.panel');
@@ -892,7 +926,8 @@
       ];
       cells.forEach((c, i) => {
         const td = document.createElement('td');
-        td.textContent = c;
+        if (i === 0) td.append(profileLink(r.username), document.createTextNode(d.neverStuck ? ' ◦' : ''));
+        else td.textContent = c;
         if (i === 0 && d.neverStuck) td.className = 'never';
         if (i === 1) td.className = 'idle';
         if (i === 4) td.className = 'dim';
