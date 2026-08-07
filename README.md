@@ -63,9 +63,21 @@ had clicked the player yourself, and the tap records what comes back.
 |---|---|
 | player | name, `◦` if they never engaged; click to open |
 | idle | time since last online — exact, not the game's rounding |
+| social | social-issue actions they have logged; hover for the economic count too |
 | rank | their `rank_key` |
 | W-L | attacks won–lost, so "worst record" finds people who lose |
 | seen | how stale *your* copy of their profile is |
+
+**Social actions** come from `alignment.social_count` — the same number the profile screen
+prints as "N actions" beside the compass. It is the only measure of activity *volume* the
+API exposes anywhere, so "most social actions" is the closest thing to sorting by who is
+actually playing the political game rather than merely logging in. `—` means you have not
+observed that player since this existed, which is not the same as zero and does not sort
+like it.
+
+**Grouping** buckets the list by faction or corporation, largest group first, with anyone
+whose membership you have not recorded last. Membership arrives with the profile, so the
+same rule applies: open a profile and it fills in.
 
 **Click any header to sort by it; click it again to flip the order.** The dropdown does the
 same thing and stays in sync with the headers, and the button beside it reverses whatever is

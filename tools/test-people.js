@@ -22,7 +22,7 @@ const S_SLICE = cut('  const ms = (iso) =>', '  // =============================
 
 /** rows() reads `people` and `ui` from the closure, so both are injected. */
 const mkRows = (people, ui, CFG) =>
-  new Function('people', 'ui', 'CFG', `${S_SLICE}\nreturn { rows, SORTS, COLUMNS, liveScore, derive };`)(people, ui, CFG);
+  new Function('people', 'ui', 'CFG', `${S_SLICE}\nreturn { rows, SORTS, COLUMNS, GROUPS, liveScore, derive };`)(people, ui, CFG);
 
 /** goProfile is never called here — it only touches history/window, which are stubs. */
 const mkWalk = (people, roster, pathname) =>
@@ -132,6 +132,48 @@ console.log('\n— sorting: order and its reverse —');
     Object.values(S).every((s) => cols.has(s.col)), true);
   check('every column points at a real sort',
     mkRows({}, base, SORT_CFG).COLUMNS.every((c) => !!S[c.sort]), true);
+}
+
+console.log('\n— action counts: absent is not zero —');
+{
+  const CFG_A = { NEVER_STUCK_MS: 2 * HOUR, LIVE_TRUST_MS: 5 * 60_000 };
+  const p = (n, alignment) => ({
+    username: n, observedAt: now, is_online: false, combat: null, alignment,
+    last_online: new Date(now - HOUR).toISOString(),
+  });
+  const ledger = {
+    busy: p('busy', { social_count: 47, economic_count: 3 }),
+    quiet: p('quiet', { social_count: 0, economic_count: 0 }),
+    unknown: p('unknown', null),
+    econ: p('econ', { social_count: 2, economic_count: 90 }),
+  };
+  const ui = { sort: 'social', dir: 1, hideNpc: true, hideOnline: false, minIdleDays: 0 };
+  const m = mkRows(ledger, ui, CFG_A);
+
+  check('most social actions first, never-observed last',
+    m.rows().map((x) => x.r.username), ['busy', 'econ', 'quiet', 'unknown']);
+
+  const d = Object.fromEntries(m.rows().map((x) => [x.r.username, x.d]));
+  check('a genuine zero is a zero', d.quiet.socialActs, 0);
+  check('an unobserved count is null, not zero', d.unknown.socialActs, null);
+  check('political is the sum of both axes', d.busy.politicalActs, 50);
+  check('...and stays null when neither axis was seen', d.unknown.politicalActs, null);
+
+  const byPolitical = mkRows(ledger, { ...ui, sort: 'political' }, CFG_A)
+    .rows().map((x) => x.r.username);
+  check('economic volume counts toward political', byPolitical[0], 'econ');
+}
+
+console.log('\n— grouping —');
+{
+  const CFG_G = { NEVER_STUCK_MS: 2 * HOUR, LIVE_TRUST_MS: 5 * 60_000 };
+  const { GROUPS } = mkRows({}, {}, CFG_G);
+  check('none does not group', GROUPS.none.of, null);
+  const r = { faction_name: 'The Hand', faction_rank: 'officer', corp_name: 'Nyx Media', corp_role: 'ceo' };
+  check('faction reads faction_name', GROUPS.faction.of(r), 'The Hand');
+  check('corp reads corp_name', GROUPS.corp.of(r), 'Nyx Media');
+  check('an empty membership groups as null, not ""', GROUPS.faction.of({ faction_name: '' }), null);
+  check('a missing membership groups as null', GROUPS.corp.of({}), null);
 }
 
 console.log('\n— "active now" only claims what it can support —');

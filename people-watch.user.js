@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Politiko — People Watch
 // @namespace    https://github.com/dataterminals/politiko-people-watch
-// @version      1.1.0
+// @version      1.2.0
 // @description  Builds a local ledger of players' last-online times, ranks and combat records from the profiles you open, and sorts it least-active-first. Fully passive: it reads responses the game already made and originates nothing. Includes a next/back walk so filling the ledger by hand is one keypress per player.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/politiko-people-watch
@@ -98,8 +98,9 @@
   /** @type {Record<string, any>} username -> observed profile */
   let people = readJSON(K.people, {});
   let roster = readJSON(K.roster, { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} });
-  let ui = readJSON(K.ui, { sort: 'idle', dir: 1, hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
+  let ui = readJSON(K.ui, { sort: 'idle', dir: 1, group: 'none', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
   if (ui.dir !== -1) ui.dir = 1;   // an older stored ui has no dir at all
+  if (typeof ui.group !== 'string') ui.group = 'none';
 
   let saveTimer = null;
   const save = () => {
@@ -154,6 +155,19 @@
       age: data.age ?? null,
       combat: data.combat_record ? { ...data.combat_record } : (cur.combat ?? null),
       relationship: data.relationship ? { ...data.relationship } : (cur.relationship ?? null),
+      // alignment carries the per-axis action counts the profile screen prints as
+      // "N actions" — the only activity *volume* the API exposes anywhere
+      alignment: data.alignment ? { ...data.alignment } : (cur.alignment ?? null),
+      // membership. Keep the old value when a field is absent rather than nulling it:
+      // a payload that simply stopped sending these should not read as "left their
+      // faction", which is a conclusion this script has no business drawing.
+      faction_id: data.faction_id ?? cur.faction_id ?? null,
+      faction_name: data.faction_name ?? cur.faction_name ?? null,
+      faction_rank: data.faction_rank ?? cur.faction_rank ?? null,
+      corp_id: data.corp_id ?? cur.corp_id ?? null,
+      corp_name: data.corp_name ?? cur.corp_name ?? null,
+      corp_role: data.corp_role ?? cur.corp_role ?? null,
+      location: data.location ?? cur.location ?? null,
       observedAt: Date.now(),
     };
     if (!roster.usernames.includes(data.username)) roster.usernames.push(data.username);
@@ -270,7 +284,16 @@
     const c = r.combat || {};
     const won = c.attacks_won ?? 0;
     const lost = c.attacks_lost ?? 0;
+    const a = r.alignment || {};
+    // null, not 0 — "never observed" and "has done none" sort differently and mean
+    // completely different things about a player
+    const num = (v) => (Number.isFinite(v) ? v : null);
+    const socialActs = num(a.social_count);
+    const econActs = num(a.economic_count);
     return {
+      socialActs,
+      econActs,
+      politicalActs: socialActs == null && econActs == null ? null : (socialActs ?? 0) + (econActs ?? 0),
       idleMs,
       idleDays: idleMs == null ? null : idleMs / 86_400_000,
       neverStuck: lifetimeMs != null && lifetimeMs < CFG.NEVER_STUCK_MS,
@@ -340,6 +363,16 @@
       label: 'rank', col: 'rank',
       cmp: (a, b) => String(a.r.rank_key ?? '').localeCompare(String(b.r.rank_key ?? '')),
     },
+    // -1 for "never observed", so an unknown count sorts below a genuine zero rather
+    // than above everyone
+    social: {
+      label: 'most social actions', col: 'social',
+      cmp: (a, b) => (b.d.socialActs ?? -1) - (a.d.socialActs ?? -1),
+    },
+    political: {
+      label: 'most political actions', col: 'social',
+      cmp: (a, b) => (b.d.politicalActs ?? -1) - (a.d.politicalActs ?? -1),
+    },
     name: {
       label: 'name', col: 'player',
       cmp: (a, b) => a.r.username.localeCompare(b.r.username),
@@ -349,10 +382,23 @@
   const COLUMNS = [
     { key: 'player', label: 'player', sort: 'name' },
     { key: 'idle', label: 'idle', sort: 'idle' },
+    { key: 'social', label: 'social', sort: 'social' },
     { key: 'rank', label: 'rank', sort: 'rank' },
     { key: 'record', label: 'W-L', sort: 'record' },
     { key: 'seen', label: 'seen', sort: 'fresh' },
   ];
+
+  /**
+   * Grouping. Membership only lands when you open someone's profile, so a player
+   * observed before this existed shows as unaffiliated until you look again — that is
+   * missing data, not a claim that they left.
+   */
+  const GROUPS = {
+    none: { label: 'no grouping', of: null },
+    faction: { label: 'group by faction', of: (r) => r.faction_name || null, sub: (r) => r.faction_rank },
+    corp: { label: 'group by corp', of: (r) => r.corp_name || null, sub: (r) => r.corp_role },
+  };
+  const UNGROUPED = 'not recorded';
 
   function rows() {
     const out = [];
@@ -510,6 +556,9 @@
     a.plink { color: inherit; text-decoration: none; cursor: pointer;
       border-bottom: 1px dotted #3f3f46; }
     a.plink:hover { color: #fafafa; border-bottom-color: #a1a1aa; }
+    tr.grp td { background: #111116; color: #a1a1aa; font-size: 10px;
+      letter-spacing: .14em; text-transform: uppercase; padding: 6px 8px;
+      border-top: 1px solid #27272a; position: sticky; }
     th.sortable { cursor: pointer; user-select: none; }
     th.sortable:hover { color: #e4e4e7; }
     th.sorted { color: #fafafa; }
@@ -827,6 +876,14 @@
     minSel.value = String(ui.minIdleDays || 0);
     minSel.onchange = () => { ui.minIdleDays = Number(minSel.value); save(); paint(); };
     bar2.append(minSel);
+
+    const grpSel = document.createElement('select');
+    for (const [v, g] of Object.entries(GROUPS)) grpSel.append(new Option(g.label, v));
+    grpSel.value = ui.group in GROUPS ? ui.group : 'none';
+    grpSel.title = 'membership is recorded when you open a profile, so anyone you have '
+      + 'not looked at since this landed shows as not recorded';
+    grpSel.onchange = () => { ui.group = grpSel.value; save(); paint(); };
+    bar2.append(grpSel);
     panel.append(bar2);
 
     const body = document.createElement('div');
@@ -853,11 +910,13 @@
     thead.append(htr);
     table.append(thead);
     const tb = document.createElement('tbody');
-    for (const { r, d } of list.slice(0, 400)) {
+
+    const buildRow = ({ r, d }) => {
       const tr = document.createElement('tr');
       const cells = [
-        r.username + (d.neverStuck ? ' ◦' : ''),
+        null,                                                     // built below, it is a link
         d.liveNow ? '● online' : fmtDur(d.idleMs),
+        d.socialActs == null ? '—' : String(d.socialActs),
         r.rank_key || '—',
         d.record,
         fmtDur(d.staleMs),
@@ -870,10 +929,47 @@
         // only claim "online" where the observation is fresh enough to support it;
         // a stale online flag is shown as plain idle time instead of a green light
         if (i === 1) td.className = d.liveNow ? 'live' : 'idle';
-        if (i === 4) td.className = 'dim';
+        if (i === 2) {
+          td.className = 'dim';
+          td.title = d.socialActs == null
+            ? 'no alignment recorded — open their profile'
+            : `${d.socialActs} social · ${d.econActs ?? 0} economic actions`;
+        }
+        if (i === 5) td.className = 'dim';
         tr.append(td);
       });
-      tb.append(tr);
+      return tr;
+    };
+
+    const capped = list.slice(0, 400);
+    const grouping = (GROUPS[ui.group] || GROUPS.none).of;
+
+    if (!grouping) {
+      for (const item of capped) tb.append(buildRow(item));
+    } else {
+      const buckets = new Map();
+      for (const item of capped) {
+        const key = grouping(item.r) ?? UNGROUPED;
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(item);
+      }
+      // biggest group first, and whoever we have no membership for goes last —
+      // it is the bucket that means "unknown", so it should not lead
+      const ordered = [...buckets.entries()].sort((a, b) => {
+        if (a[0] === UNGROUPED) return 1;
+        if (b[0] === UNGROUPED) return -1;
+        return b[1].length - a[1].length || a[0].localeCompare(b[0]);
+      });
+      for (const [name, members] of ordered) {
+        const head = document.createElement('tr');
+        head.className = 'grp';
+        const td = document.createElement('td');
+        td.colSpan = COLUMNS.length;
+        td.textContent = `${name} · ${members.length}`;
+        head.append(td);
+        tb.append(head);
+        for (const item of members) tb.append(buildRow(item));
+      }
     }
     table.append(tb);
     body.append(table);
