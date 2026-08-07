@@ -67,6 +67,30 @@ had clicked the player yourself, and the tap records what comes back.
 | W-L | attacks won–lost, so "worst record" finds people who lose |
 | seen | how stale *your* copy of their profile is |
 
+**Click any header to sort by it; click it again to flip the order.** The dropdown does the
+same thing and stays in sync with the headers, and the button beside it reverses whatever is
+currently selected. Each sort's natural order matches its label — "most idle" puts the most
+idle first, "name" goes A→Z — and reversing flips that, which is why one toggle works across
+columns that don't share a direction.
+
+### "Active now", and what it can honestly tell you
+
+There is no presence feed. `is_online` is a claim about *this moment* taken from an
+observation made whenever you last opened that profile, so it decays: someone marked online
+three days ago is just someone who was online once.
+
+The **active now** sort ranks by how much the ledger can actually support:
+
+1. seen online, and seen within the last five minutes
+2. seen online, but a while ago — no evidence about now
+3. not flagged online, but their `last_online` is within minutes
+4. everything else, most recent first
+
+Only the first tier is shown as a green **● online** in the idle column. The second tier
+sorts high but still displays plain idle time, because claiming otherwise would be inventing
+a fact. If you want this to mean something, walk the roster first — the readings are only as
+current as your last pass.
+
 ## Console
 
 ```js

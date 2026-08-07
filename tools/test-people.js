@@ -18,6 +18,11 @@ const cut = (from, to) => {
 
 const W_SLICE = cut('  const PROFILE_RE =', '  // ===========================================================================\n  // Derived metrics');
 const D_SLICE = cut('  const ms = (iso) =>', '  const fmtDur = (msv)');
+const S_SLICE = cut('  const ms = (iso) =>', '  // ===========================================================================\n  // Panel');
+
+/** rows() reads `people` and `ui` from the closure, so both are injected. */
+const mkRows = (people, ui, CFG) =>
+  new Function('people', 'ui', 'CFG', `${S_SLICE}\nreturn { rows, SORTS, COLUMNS, liveScore, derive };`)(people, ui, CFG);
 
 /** goProfile is never called here — it only touches history/window, which are stubs. */
 const mkWalk = (people, roster, pathname) =>
@@ -95,6 +100,67 @@ console.log('\n— walk: skipping to what is missing —');
   const roster = rosterOf('ana', 'bo');
   const w = mkWalk({ bo: { username: 'bo' } }, roster, '/profile/ana');
   check('a name seen on the roster but never opened is still unseen', w.nextUnseen(), 'bo');
+}
+
+console.log('\n— sorting: order and its reverse —');
+{
+  const SORT_CFG = { NEVER_STUCK_MS: 2 * HOUR, LIVE_TRUST_MS: 5 * 60_000 };
+  const who = (n, over) => ({
+    username: n, observedAt: now, is_npc: false, is_online: false,
+    last_online: new Date(now - 3 * HOUR).toISOString(),
+    created_at: new Date(now - 30 * 24 * HOUR).toISOString(),
+    combat: { attacks_won: 1, attacks_lost: 1 }, ...over,
+  });
+  const ledger = {
+    ana: who('ana', { last_online: new Date(now - 9 * 24 * HOUR).toISOString() }),   // most idle
+    bo: who('bo', { last_online: new Date(now - 1 * HOUR).toISOString() }),
+    cy: who('cy', { last_online: new Date(now - 30_000).toISOString() }),            // just now
+  };
+  const base = { hideNpc: true, hideOnline: false, minIdleDays: 0 };
+  const names = (ui) => mkRows(ledger, { ...base, ...ui }, SORT_CFG).rows().map((x) => x.r.username);
+
+  check('most idle, natural order', names({ sort: 'idle', dir: 1 }), ['ana', 'bo', 'cy']);
+  check('...reversed', names({ sort: 'idle', dir: -1 }), ['cy', 'bo', 'ana']);
+  check('name, natural order', names({ sort: 'name', dir: 1 }), ['ana', 'bo', 'cy']);
+  check('...reversed', names({ sort: 'name', dir: -1 }), ['cy', 'bo', 'ana']);
+  check('an unknown sort key falls back to idle', names({ sort: 'nope', dir: 1 }), ['ana', 'bo', 'cy']);
+
+  // every sort must name a real column, or a header can never show as active
+  const cols = new Set(mkRows({}, base, SORT_CFG).COLUMNS.map((c) => c.key));
+  const S = mkRows({}, base, SORT_CFG).SORTS;
+  check('every sort points at a real column',
+    Object.values(S).every((s) => cols.has(s.col)), true);
+  check('every column points at a real sort',
+    mkRows({}, base, SORT_CFG).COLUMNS.every((c) => !!S[c.sort]), true);
+}
+
+console.log('\n— "active now" only claims what it can support —');
+{
+  const CFG_L = { NEVER_STUCK_MS: 2 * HOUR, LIVE_TRUST_MS: 5 * 60_000 };
+  const { liveScore } = mkRows({}, {}, CFG_L);
+  const idle3h = 3 * HOUR;
+  check('online, and freshly observed', liveScore({ is_online: true }, 60_000, idle3h), 3);
+  check('online, but observed hours ago', liveScore({ is_online: true }, 3 * HOUR, idle3h), 2);
+  check('not flagged online, but last seen a minute ago', liveScore({ is_online: false }, 3 * HOUR, 60_000), 1);
+  check('nothing to suggest activity', liveScore({ is_online: false }, 3 * HOUR, idle3h), 0);
+  check('an online flag with no observation time is not trusted',
+    liveScore({ is_online: true }, null, idle3h), 2);
+}
+{
+  const CFG_L = { NEVER_STUCK_MS: 2 * HOUR, LIVE_TRUST_MS: 5 * 60_000 };
+  const stale = { username: 'stale', observedAt: now - 6 * HOUR, is_online: true,
+    last_online: new Date(now - 6 * HOUR).toISOString(), combat: null };
+  const fresh = { username: 'fresh', observedAt: now - 30_000, is_online: true,
+    last_online: new Date(now - 30_000).toISOString(), combat: null };
+  const quiet = { username: 'quiet', observedAt: now - 30_000, is_online: false,
+    last_online: new Date(now - 4 * 24 * HOUR).toISOString(), combat: null };
+  const ui = { sort: 'live', dir: 1, hideNpc: true, hideOnline: false, minIdleDays: 0 };
+  const got = mkRows({ stale, fresh, quiet }, ui, CFG_L).rows().map((x) => x.r.username);
+  check('a trusted online reading outranks a stale one', got, ['fresh', 'stale', 'quiet']);
+
+  const marked = mkRows({ stale, fresh, quiet }, ui, CFG_L).rows()
+    .filter((x) => x.d.liveNow).map((x) => x.r.username);
+  check('only the fresh one is marked live', marked, ['fresh']);
 }
 
 console.log('\n— metrics —');

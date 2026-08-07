@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Politiko — People Watch
 // @namespace    https://github.com/dataterminals/politiko-people-watch
-// @version      1.0.0
+// @version      1.1.0
 // @description  Builds a local ledger of players' last-online times, ranks and combat records from the profiles you open, and sorts it least-active-first. Fully passive: it reads responses the game already made and originates nothing. Includes a next/back walk so filling the ledger by hand is one keypress per player.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/politiko-people-watch
@@ -63,6 +63,11 @@
     // A profile whose whole lifetime was shorter than this never really engaged.
     NEVER_STUCK_MS: 2 * 3600_000,
 
+    // `is_online` is a claim about *now* made from an observation taken whenever you
+    // last opened that profile. It is only worth anything while that observation is
+    // fresh — past this, someone "online" is just someone who was online once.
+    LIVE_TRUST_MS: 5 * 60_000,
+
     HOTKEY: 'p',                // Alt+P toggles the panel
     WALK_PREV: '[',             // on a profile page, step back through the roster
     WALK_NEXT: ']',             // ...and forward
@@ -93,7 +98,8 @@
   /** @type {Record<string, any>} username -> observed profile */
   let people = readJSON(K.people, {});
   let roster = readJSON(K.roster, { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} });
-  let ui = readJSON(K.ui, { sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
+  let ui = readJSON(K.ui, { sort: 'idle', dir: 1, hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
+  if (ui.dir !== -1) ui.dir = 1;   // an older stored ui has no dir at all
 
   let saveTimer = null;
   const save = () => {
@@ -259,6 +265,8 @@
     const made = ms(r.created_at);
     const idleMs = last ? Date.now() - last : null;
     const lifetimeMs = last && made ? last - made : null;
+    const staleMs = r.observedAt ? Date.now() - r.observedAt : null;
+    const live = liveScore(r, staleMs, idleMs);
     const c = r.combat || {};
     const won = c.attacks_won ?? 0;
     const lost = c.attacks_lost ?? 0;
@@ -269,8 +277,27 @@
       lifetimeMs,
       won, lost,
       record: `${won}-${lost}`,
-      staleMs: r.observedAt ? Date.now() - r.observedAt : null,
+      staleMs,
+      live,
+      liveNow: live === 3,
     };
+  }
+
+  /**
+   * How much the ledger can say about someone being active *right now*, which is not
+   * something it can ever really know — every field here was true when you looked, and
+   * nothing refreshes on its own.
+   *
+   *   3  seen online, and seen recently enough to still mean it
+   *   2  seen online, but a while ago — no evidence about now
+   *   1  not flagged online, but their last_online is within minutes of now
+   *   0  nothing suggesting activity
+   */
+  function liveScore(r, staleMs, idleMs) {
+    if (r.is_online && staleMs != null && staleMs <= CFG.LIVE_TRUST_MS) return 3;
+    if (r.is_online) return 2;
+    if (idleMs != null && idleMs <= CFG.LIVE_TRUST_MS) return 1;
+    return 0;
   }
 
   const fmtDur = (msv) => {
@@ -281,6 +308,51 @@
     const d = Math.floor(s / 86400);
     return d < 365 ? `${d}d` : `${(d / 365).toFixed(1)}y`;
   };
+
+  /**
+   * Every sort is written so its *natural* order matches its label — "most idle" puts
+   * the most idle first. `ui.dir === -1` reverses whatever that was, which keeps one
+   * toggle meaningful across columns that don't share a direction (A→Z is ascending,
+   * most-idle-first is descending, and both are "natural" for their label).
+   *
+   * `col` is the table column the sort belongs to, so clicking a header and picking
+   * from the dropdown drive the same state.
+   */
+  const SORTS = {
+    idle: {
+      label: 'most idle', col: 'idle',
+      cmp: (a, b) => (b.d.idleMs ?? -1) - (a.d.idleMs ?? -1),
+    },
+    live: {
+      label: 'active now', col: 'idle',
+      // ranked by how much the ledger can actually claim, then by recency within that
+      cmp: (a, b) => (b.d.live - a.d.live) || ((a.d.idleMs ?? Infinity) - (b.d.idleMs ?? Infinity)),
+    },
+    record: {
+      label: 'worst record', col: 'record',
+      cmp: (a, b) => (b.d.lost - b.d.won) - (a.d.lost - a.d.won),
+    },
+    fresh: {
+      label: 'freshest data', col: 'seen',
+      cmp: (a, b) => (a.d.staleMs ?? 0) - (b.d.staleMs ?? 0),
+    },
+    rank: {
+      label: 'rank', col: 'rank',
+      cmp: (a, b) => String(a.r.rank_key ?? '').localeCompare(String(b.r.rank_key ?? '')),
+    },
+    name: {
+      label: 'name', col: 'player',
+      cmp: (a, b) => a.r.username.localeCompare(b.r.username),
+    },
+  };
+
+  const COLUMNS = [
+    { key: 'player', label: 'player', sort: 'name' },
+    { key: 'idle', label: 'idle', sort: 'idle' },
+    { key: 'rank', label: 'rank', sort: 'rank' },
+    { key: 'record', label: 'W-L', sort: 'record' },
+    { key: 'seen', label: 'seen', sort: 'fresh' },
+  ];
 
   function rows() {
     const out = [];
@@ -293,13 +365,10 @@
       if (ui.minIdleDays && (d.idleDays ?? 0) < ui.minIdleDays) continue;
       out.push({ r, d });
     }
-    const by = {
-      idle: (a, b) => (b.d.idleMs ?? -1) - (a.d.idleMs ?? -1),
-      name: (a, b) => a.r.username.localeCompare(b.r.username),
-      record: (a, b) => (b.d.lost - b.d.won) - (a.d.lost - a.d.won),
-      fresh: (a, b) => (a.d.staleMs ?? 0) - (b.d.staleMs ?? 0),
-    };
-    return out.sort(by[ui.sort] || by.idle);
+    const cmp = (SORTS[ui.sort] || SORTS.idle).cmp;
+    out.sort(cmp);
+    if (ui.dir === -1) out.reverse();
+    return out;
   }
 
   // ===========================================================================
@@ -441,6 +510,10 @@
     a.plink { color: inherit; text-decoration: none; cursor: pointer;
       border-bottom: 1px dotted #3f3f46; }
     a.plink:hover { color: #fafafa; border-bottom-color: #a1a1aa; }
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: #e4e4e7; }
+    th.sorted { color: #fafafa; }
+    .live { color: #4ade80; }
     .idle { color: #f87171; }
     .never { color: #fbbf24; }
     .dim { color: #71717a; }
@@ -729,12 +802,17 @@
     const bar2 = document.createElement('div');
     bar2.className = 'bar';
     const sortSel = document.createElement('select');
-    for (const [l, v] of [['most idle', 'idle'], ['worst record', 'record'], ['freshest data', 'fresh'], ['name', 'name']]) {
-      sortSel.append(new Option(l, v));
-    }
+    for (const [v, s] of Object.entries(SORTS)) sortSel.append(new Option(s.label, v));
     sortSel.value = ui.sort;
     sortSel.onchange = () => { ui.sort = sortSel.value; save(); paint(); };
     bar2.append(sortSel);
+
+    const rev = document.createElement('button');
+    rev.textContent = ui.dir === -1 ? '↑ reversed' : '↓ normal';
+    rev.title = 'flip the order of whatever is selected';
+    if (ui.dir === -1) rev.className = 'on';
+    rev.onclick = () => { ui.dir = ui.dir === -1 ? 1 : -1; save(); paint(); };
+    bar2.append(rev);
 
     const mk = (label, key) => {
       const b = document.createElement('button');
@@ -754,15 +832,32 @@
     const body = document.createElement('div');
     body.className = 'body';
     const table = document.createElement('table');
+    // Clicking a header sorts by it; clicking the one already sorted flips the order.
     const thead = document.createElement('thead');
-    thead.innerHTML = '<tr><th>player</th><th>idle</th><th>rank</th><th>W-L</th><th>seen</th></tr>';
+    const htr = document.createElement('tr');
+    const activeCol = (SORTS[ui.sort] || SORTS.idle).col;
+    for (const c of COLUMNS) {
+      const th = document.createElement('th');
+      th.className = 'sortable';
+      const on = c.key === activeCol;
+      th.textContent = c.label + (on ? (ui.dir === -1 ? ' ▲' : ' ▼') : '');
+      if (on) th.classList.add('sorted');
+      th.title = on ? 'click to reverse' : `sort by ${SORTS[c.sort].label}`;
+      th.onclick = () => {
+        if (c.key === activeCol) ui.dir = ui.dir === -1 ? 1 : -1;
+        else { ui.sort = c.sort; ui.dir = 1; }
+        save(); paint();
+      };
+      htr.append(th);
+    }
+    thead.append(htr);
     table.append(thead);
     const tb = document.createElement('tbody');
     for (const { r, d } of list.slice(0, 400)) {
       const tr = document.createElement('tr');
       const cells = [
         r.username + (d.neverStuck ? ' ◦' : ''),
-        fmtDur(d.idleMs),
+        d.liveNow ? '● online' : fmtDur(d.idleMs),
         r.rank_key || '—',
         d.record,
         fmtDur(d.staleMs),
@@ -772,7 +867,9 @@
         if (i === 0) td.append(profileLink(r.username), document.createTextNode(d.neverStuck ? ' ◦' : ''));
         else td.textContent = c;
         if (i === 0 && d.neverStuck) td.className = 'never';
-        if (i === 1) td.className = 'idle';
+        // only claim "online" where the observation is fresh enough to support it;
+        // a stale online flag is shown as plain idle time instead of a green light
+        if (i === 1) td.className = d.liveNow ? 'live' : 'idle';
         if (i === 4) td.className = 'dim';
         tr.append(td);
       });
