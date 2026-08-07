@@ -1,7 +1,10 @@
 # Politiko — People Watch
 
 A userscript for [Politiko](https://politiko.io) that builds a local ledger of the players
-it sees — last-online times, ranks, combat records — and sorts it least-active-first.
+you look at — last-online times, ranks, combat records — and sorts it least-active-first.
+
+It is **fully passive**. It reads responses the game already made, on pages you are
+actively viewing, and originates no requests of its own.
 
 ## Install
 
@@ -9,41 +12,89 @@ it sees — last-online times, ranks, combat records — and sorts it least-acti
 2. Open [`people-watch.user.js`](https://raw.githubusercontent.com/dataterminals/politiko-people-watch/main/people-watch.user.js)
    and confirm the install prompt.
 
-## What it does
+## What it's for
 
-The game rounds "last seen" to whole days in the UI, but sends exact timestamps. This keeps
-the exact values, accumulates them across the profiles and roster pages you visit, and
-ranks the result.
+The game rounds "last seen" to whole days in the UI, but the API sends exact timestamps.
+This keeps the exact values and ranks by them, so you can tell six days idle from six
+hours.
 
-The gap between when an account was created and when it was last seen separates someone who
-played for half an hour and left from someone who played for weeks — the UI renders both the
-same way.
+It also computes something the UI can't show at all: the gap between `created_at` and
+`last_online`. Someone who played for 39 minutes and quit, and someone who played for three
+weeks and then stopped, both render as "4 days" in game. A `◦` next to a name means their
+entire account lifetime was under two hours — they never really engaged.
 
-Everything is stored locally in your browser under `pkpw:` keys and can be cleared from the
-panel.
+## How to use it
 
-## Arming — read this first
+**Alt+P**, or click the triangle button, to open the panel. Drag either wherever you like;
+they remember.
 
-By default the script is **disarmed** on every load, and in that state it only reads
-responses the game fetched on its own. It originates nothing.
+The header shows two numbers — `12/292 profiled · 40 known`:
 
-**Armed in `live` mode, it crawls.** It issues paced, jittered, foreground-only requests to
-the roster and profile endpoints to fill gaps in the ledger, capped per session and stopping
-on the first non-2xx response. That reduces the footprint. It does not make the script
-passive.
+- **known** — usernames it has seen on roster pages (the People tab)
+- **profiled** — players it actually has data for
 
-Politiko's scripting clause prohibits this, and the penalty is a game ban. Arming is a
-deliberate choice with a real cost attached — the header comment in the script sets it out
-in full. Arm it understanding that, or leave it disarmed and let the ledger fill from normal
-play.
+Only profiled players appear in the table. A username on its own gives it nothing to rank.
 
-Arming is persistent and expiring: it does not silently stay on forever.
+So the loop is:
+
+1. **Open the People tab and page through it.** Every page is captured for free — that's
+   `known` climbing, and it's what the walk below needs.
+2. **Open profiles.** Each one you open is recorded permanently, at full precision.
+3. **Walk the roster.** On any profile page the panel grows a walk bar:
+
+   | control | does |
+   |---|---|
+   | `‹ [` | previous player in the roster |
+   | `] ›` | next player |
+   | `next unseen ›` | skip ahead to someone with no profile yet |
+
+   The `[` and `]` keys do the same thing without the panel open, so a pass through the
+   roster is one keypress per player. They are ignored while you are typing, so chat
+   still works.
+4. **Read the table.** Sort **most idle**, set **≥7d idle**, tick **hide npc** and
+   **hide online**. Player names are links — click one to jump straight there.
+
+Each step is a normal navigation. The game fetches that profile exactly as it would if you
+had clicked the player yourself, and the tap records what comes back.
+
+## The table
+
+| column | what it is |
+|---|---|
+| player | name, `◦` if they never engaged; click to open |
+| idle | time since last online — exact, not the game's rounding |
+| rank | their `rank_key` |
+| W-L | attacks won–lost, so "worst record" finds people who lose |
+| seen | how stale *your* copy of their profile is |
+
+## Console
+
+```js
+__pkpw.unseen()    // usernames known but not yet profiled
+__pkpw.rows()      // the table, as data
+__pkpw.export()    // the whole ledger as JSON
+__pkpw.clear()     // wipe it
+```
 
 ## What it reads
 
-Full disclosure — reads, what it originates when armed, storage, network — is in the header
-comment at the top of [`people-watch.user.js`](people-watch.user.js). Read it before
-installing.
+Full disclosure — reads, storage, network — is in the header comment at the top of
+[`people-watch.user.js`](people-watch.user.js). In short: it reads `/api/people` and
+`/api/users/<name>` responses the game itself requested, stores them under `pkpw:` keys in
+your browser, and sends nothing anywhere.
+
+**The ledger holds other players' public profile data.** It never leaves your browser and
+must not be committed anywhere.
+
+## History
+
+Versions up to 0.4.0 shipped an opt-in crawler that originated paced requests to fill the
+ledger automatically. Politiko's scripting clause prohibits that and the penalty is a game
+ban; it was carried as a knowingly accepted risk.
+
+**It is gone as of 1.0.0** — the arming system, the queue, the pacing and every
+request-originating line were removed rather than disabled. The walk replaces it, and the
+walk is just you pressing a key.
 
 ## Tests
 
@@ -52,14 +103,12 @@ node tools/test-people.js
 node tools/test-placement.js
 ```
 
-`test-people` exercises the backfill queue and metric layers against synthetic ledger state. The queue
-decides how many requests get originated against a live account, so it is the part worth
-pinning down: it must not re-serve a job that already landed, must not spin on one that
-never will, and must go quiet once everything is fresh.
+`test-people` covers the walk layer — where a keypress sends you, and which players
+`next unseen` is allowed to skip — plus the derived metrics. An off-by-one in the walk
+means silently missing a player on a list you are stepping through by hand.
 
-`test-placement` exercises the panel placement layer against a synthetic viewport: the
-button stays on screen, and the panel stays fully visible from whichever corner the button
-was dragged into.
+`test-placement` covers the panel placement layer against a synthetic viewport: the button
+stays on screen and clear of the game's Comms dock, and the panel stays fully visible from
+whichever corner the button was dragged into.
 
-Both slice their layers straight out of the shipped script, so they cannot drift from the
-source.
+Both slice their layers straight out of the shipped script, so they cannot drift from it.

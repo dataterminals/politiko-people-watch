@@ -1,8 +1,11 @@
-// Slices the real backfill queue and metric layers out of people-watch and exercises
-// them against synthetic ledger state. The queue decides how many requests get
-// originated against a live account, so it is the part worth pinning down: it must
-// not re-serve a job that already landed, must not spin on one that never will, and
-// must go quiet the moment everything is fresh.
+// Slices the real walk and metric layers out of people-watch and exercises them
+// against synthetic ledger state.
+//
+// The queue suite that used to live here is gone with the crawler it tested: there is
+// no longer any code that decides what to request, because nothing is requested. What
+// replaces it is the walk, and that is worth pinning down for a different reason — it
+// decides where a keypress sends you, and an off-by-one there means silently skipping
+// a player on a 292-name list you are stepping through by hand.
 const fs = require('fs');
 const path = require('path');
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'people-watch.user.js'), 'utf8');
@@ -13,25 +16,21 @@ const cut = (from, to) => {
   return SRC.slice(i, j);
 };
 
-const Q_SLICE = cut('  // Jobs that came back 2xx but left no usable record', '  const jitter = ()');
+const W_SLICE = cut('  const PROFILE_RE =', '  // ===========================================================================\n  // Derived metrics');
 const D_SLICE = cut('  const ms = (iso) =>', '  const fmtDur = (msv)');
 
-const mkQueue = (people, roster, CFG) =>
-  new Function('people', 'roster', 'CFG', `${Q_SLICE}\nreturn { buildQueue, blocked, jobId, landed };`)(people, roster, CFG);
+/** goProfile is never called here — it only touches history/window, which are stubs. */
+const mkWalk = (people, roster, pathname) =>
+  new Function('people', 'roster', 'location', 'history', 'window', 'paint',
+    `${W_SLICE}\nreturn { step, nextUnseen, currentProfile, walkOrder, mod };`)(
+    people, roster, { pathname }, { pushState() {} }, { dispatchEvent() {} }, () => {});
 
-const mkDerive = (CFG) =>
-  new Function('CFG', `${D_SLICE}\nreturn { derive, ms };`)(CFG);
+const mkDerive = (CFG) => new Function('CFG', `${D_SLICE}\nreturn { derive, ms };`)(CFG);
 
-const CFG = {
-  ROSTER_REFRESH_AFTER_MS: 6 * 3600_000,
-  REFRESH_AFTER_MS: 12 * 3600_000,
-  NEVER_STUCK_MS: 2 * 3600_000,
-};
+const CFG = { NEVER_STUCK_MS: 2 * 3600_000 };
 
 const HOUR = 3600_000;
 const now = Date.now();
-const fresh = now - 60_000;
-const stale = now - 48 * HOUR;
 
 let fail = 0;
 const check = (label, got, want) => {
@@ -40,82 +39,62 @@ const check = (label, got, want) => {
   if (!ok) { console.log(`        got  ${JSON.stringify(got)}\n        want ${JSON.stringify(want)}`); fail++; }
 };
 
-const emptyRoster = () => ({ total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} });
-const ids = (jobs) => jobs.map((j) => (j.kind === 'roster' ? `r:${j.page}` : `p:${j.username}`));
+const rosterOf = (...usernames) => ({ total: usernames.length, totalPages: 1, usernames, seenAt: now, pages: { 1: now } });
+const seen = (...usernames) => Object.fromEntries(usernames.map((u) => [u, { username: u, observedAt: now }]));
 
-console.log('\n— queue: roster enumeration —');
+console.log('\n— walk: where am I —');
 {
-  const m = mkQueue({}, emptyRoster(), CFG);
-  check('cold start asks for page 1 and nothing else', ids(m.buildQueue()), ['r:1']);
+  const w = mkWalk({}, rosterOf('ana'), '/profile/ana');
+  check('a profile route yields the username', w.currentProfile(), 'ana');
 }
 {
-  const roster = { ...emptyRoster(), totalPages: 3 };
-  const m = mkQueue({}, roster, CFG);
-  check('known page count enumerates every page', ids(m.buildQueue()), ['r:1', 'r:2', 'r:3']);
+  const w = mkWalk({}, rosterOf('ana'), '/people');
+  check('any other route yields null', w.currentProfile(), null);
 }
 {
-  const roster = { ...emptyRoster(), totalPages: 3, pages: { 1: fresh, 2: fresh, 3: fresh } };
-  const m = mkQueue({}, roster, CFG);
-  check('freshly-walked roster queues nothing', ids(m.buildQueue()), []);
-}
-{
-  const roster = { ...emptyRoster(), totalPages: 3, pages: { 1: fresh, 2: now - 7 * HOUR, 3: fresh } };
-  const m = mkQueue({}, roster, CFG);
-  check('only the stale page comes back', ids(m.buildQueue()), ['r:2']);
+  const w = mkWalk({}, rosterOf('a b'), '/profile/a%20b');
+  check('an encoded name is decoded', w.currentProfile(), 'a b');
 }
 
-console.log('\n— queue: profiles —');
+console.log('\n— walk: stepping —');
 {
-  const roster = { ...emptyRoster(), totalPages: 1, pages: { 1: fresh }, usernames: ['ana', 'bo', 'cy'] };
-  const m = mkQueue({}, roster, CFG);
-  check('every known player with no profile is queued', ids(m.buildQueue()), ['p:ana', 'p:bo', 'p:cy']);
+  const roster = rosterOf('ana', 'bo', 'cy');
+  check('forward moves one', mkWalk({}, roster, '/profile/ana').step(1), 'bo');
+  check('back moves one', mkWalk({}, roster, '/profile/bo').step(-1), 'ana');
+  check('forward wraps at the end', mkWalk({}, roster, '/profile/cy').step(1), 'ana');
+  check('back wraps at the start', mkWalk({}, roster, '/profile/ana').step(-1), 'cy');
 }
 {
-  const roster = { ...emptyRoster(), totalPages: 1, pages: { 1: fresh }, usernames: ['ana', 'bo'] };
-  const people = { ana: { username: 'ana', observedAt: fresh } };
-  const m = mkQueue(people, roster, CFG);
-  check('a fresh profile is not re-fetched', ids(m.buildQueue()), ['p:bo']);
+  // you can land on a profile that was never on a roster page you walked
+  const w = mkWalk({}, rosterOf('ana', 'bo'), '/profile/stranger');
+  check('a stranger starts the walk at the top of the roster', w.step(1), 'ana');
 }
 {
-  const roster = { ...emptyRoster(), totalPages: 1, pages: { 1: fresh }, usernames: ['ana', 'bo', 'cy'] };
-  const people = {
-    ana: { username: 'ana', observedAt: now - 20 * HOUR },
-    bo: { username: 'bo', observedAt: now - 90 * HOUR },
-    cy: { username: 'cy', observedAt: fresh },
-  };
-  const m = mkQueue(people, roster, CFG);
-  check('stale profiles refresh oldest-observation first', ids(m.buildQueue()), ['p:bo', 'p:ana']);
-}
-{
-  const roster = { ...emptyRoster(), totalPages: 1, pages: { 1: fresh }, usernames: ['ana', 'bo'] };
-  const people = { ana: { username: 'ana', observedAt: fresh }, bo: { username: 'bo', observedAt: fresh } };
-  const m = mkQueue(people, roster, CFG);
-  check('a fully fresh ledger goes quiet', ids(m.buildQueue()), []);
+  const w = mkWalk({}, rosterOf(), '/profile/ana');
+  check('an empty roster has nowhere to go', w.step(1), null);
 }
 
-console.log('\n— queue: retirement (the anti-spin guard) —');
+console.log('\n— walk: skipping to what is missing —');
 {
-  const roster = { ...emptyRoster(), totalPages: 1, pages: { 1: fresh }, usernames: ['ghost', 'bo'] };
-  const m = mkQueue({}, roster, CFG);
-  check('ghost is queued before being retired', ids(m.buildQueue()), ['p:ghost', 'p:bo']);
-  m.blocked.add('p:ghost');
-  check('retired job disappears from the queue', ids(m.buildQueue()), ['p:bo']);
+  const roster = rosterOf('ana', 'bo', 'cy', 'di');
+  const w = mkWalk(seen('bo', 'cy'), roster, '/profile/ana');
+  check('skips players already profiled', w.nextUnseen(), 'di');
 }
 {
-  const roster = { ...emptyRoster(), totalPages: 2, pages: {} };
-  const m = mkQueue({}, roster, CFG);
-  m.blocked.add('r:1');
-  check('a retired roster page is skipped too', ids(m.buildQueue()), ['r:2']);
+  const roster = rosterOf('ana', 'bo', 'cy');
+  const w = mkWalk(seen('bo'), roster, '/profile/cy');
+  check('wraps around to find one behind you', w.nextUnseen(), 'ana');
 }
 {
-  const roster = { ...emptyRoster(), totalPages: 1, pages: { 1: fresh }, usernames: ['ana'] };
-  const people = { ana: { username: 'ana' } };  // roster-only, never profiled
-  const m = mkQueue(people, roster, CFG);
-  check('landed() is false for a roster-only record', m.landed({ kind: 'profile', username: 'ana' }), false);
-  people.ana.observedAt = now;
-  check('landed() flips once a profile is recorded', m.landed({ kind: 'profile', username: 'ana' }), true);
-  check('landed() reads roster pages by number', m.landed({ kind: 'roster', page: 1 }), true);
-  check('...and is false for an unseen page', m.landed({ kind: 'roster', page: 9 }), false);
+  const roster = rosterOf('ana', 'bo');
+  const w = mkWalk(seen('ana', 'bo'), roster, '/profile/ana');
+  check('a fully profiled roster has no next', w.nextUnseen(), null);
+}
+{
+  // a roster-only record has no observedAt, so it still counts as unprofiled
+  const roster = rosterOf('ana', 'bo');
+  const w = mkWalk({ bo: { username: 'bo' } }, roster, '/profile/ana');
+  check('a name seen on the roster but never opened is still unseen', w.nextUnseen(), 'bo');
 }
 
 console.log('\n— metrics —');

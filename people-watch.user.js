@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Politiko — People Watch
 // @namespace    https://github.com/dataterminals/politiko-people-watch
-// @version      0.4.0
-// @description  Builds a local ledger of players' last-online times, ranks and combat records, and sorts it least-active-first. Reads profiles the app fetches on its own; when explicitly armed, ORIGINATES paced requests to /api/people and /api/users/{name} to fill the gaps.
+// @version      1.0.0
+// @description  Builds a local ledger of players' last-online times, ranks and combat records from the profiles you open, and sorts it least-active-first. Fully passive: it reads responses the game already made and originates nothing. Includes a next/back walk so filling the ledger by hand is one keypress per player.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/politiko-people-watch
 // @supportURL   https://github.com/dataterminals/politiko-people-watch/issues
@@ -16,46 +16,38 @@
 /*
  * DISCLOSURE (Politiko rules, Scripting Abuse clause)
  *
- * READ THIS BEFORE SHARING THE FILE. Unlike every other tool in this repo, this one
- * is NOT passive when armed. It originates requests to politiko.io.
- *
- *   Reads:    JSON bodies of /api/* responses via a passive fetch/XHR tap — both the
- *             ones the app requested on its own and the ones this script requested.
+ *   Reads:    JSON bodies of /api/* responses via a passive fetch/XHR tap — only the
+ *             ones the game requested on its own, on pages you are actively viewing.
  *             Specifically /api/people (roster pages) and /api/users/<name> (profiles).
  *             No DOM scraping.
  *
- *   Requests: ZERO while disarmed — the default on every load. Arming is a deliberate
- *             act with an expiry, and survives reload only until that expiry.
+ *   Requests: ZERO. This script does not originate network calls to politiko.io.
  *
- *             Clicking a name in the panel is navigation, not a request this script
- *             originates: it performs the same client-side route change as clicking
- *             that player anywhere else in the game, and the app then fetches the
- *             profile as it always would — only because you clicked.
- *
- *             WHEN ARMED IN 'live' MODE THIS SCRIPT ORIGINATES REQUESTS:
- *               GET /api/people?page=N   — up to `total_pages` (30 at time of writing)
- *               GET /api/users/<name>    — one per player (292 at time of writing)
- *             They are paced, jittered, foreground-only, capped per session, and stop
- *             dead on the first non-2xx. That reduces the footprint; it does not make
- *             the script passive. It is a crawl.
- *
- *             This is prohibited by Politiko's scripting clause — items 2 and 5,
- *             penalty: game ban. It is an accepted-risk decision taken knowingly on
- *             2026-07-28. Arm it understanding that, or leave it disarmed.
+ *             Clicking a name in the panel, or a walk button, is navigation — not a
+ *             request this script originates. It performs the same client-side route
+ *             change as clicking that player anywhere else in the game, and the app
+ *             then fetches the profile as it always would, once, because you clicked.
+ *             Nothing is queued, paced, retried, or continued in the background.
  *
  *   Sends:    nothing, to anyone, ever. No telemetry, no remote config, no export
  *             off-machine. Everything stays in this browser.
  *
  *   Storage:  localStorage keys prefixed `pkpw:` — the observed player ledger, roster
- *             metadata, backfill progress, and panel settings. All local. Clearable
- *             from the panel.
+ *             metadata, and panel settings. All local. Clearable from the panel.
  *
- *   Alerts:   none. No notifications, no title flashing, no sound. The crawl pauses
- *             while the tab is hidden and resumes when it is focused again.
+ *   Alerts:   none. No notifications, no title flashing, no sound.
  *
  *   Personal data: the ledger holds other players' usernames and public profile fields.
  *             It never leaves this browser and must never be committed — artifacts/ and
  *             anything session-derived are gitignored for exactly this reason.
+ *
+ * HISTORY, stated plainly because the file used to say otherwise: versions up to 0.4.0
+ * shipped an opt-in crawler that originated paced requests to /api/people and
+ * /api/users/<name> to fill the ledger automatically. That is prohibited by the
+ * scripting clause — items 2 and 5, penalty game ban — and it was carried as a
+ * knowingly accepted risk from 2026-07-28. It is gone as of 1.0.0: the arming system,
+ * the queue, the pacing and the request-originating code have all been removed rather
+ * than disabled. What replaces it is the walk, which is just you pressing a key.
  */
 
 (() => {
@@ -68,21 +60,12 @@
   // Config
   // ===========================================================================
   const CFG = {
-    // Pacing. A full sweep is ~322 requests; at 8s that is roughly 45 minutes.
-    // Slower is safer. These are the knobs to turn if anything looks unwelcome.
-    MIN_GAP_MS: 8_000,
-    JITTER_MS: 4_000,           // added randomly on top of MIN_GAP, so it isn't a metronome
-    MAX_REQUESTS_PER_SESSION: 500,  // backstop against a loop; reset on reload
-    PAUSE_WHEN_HIDDEN: true,    // never crawl a tab you aren't looking at
-
-    REFRESH_AFTER_MS: 12 * 3600_000,  // a profile older than this is eligible for re-fetch
-    ROSTER_REFRESH_AFTER_MS: 6 * 3600_000,
-
     // A profile whose whole lifetime was shorter than this never really engaged.
     NEVER_STUCK_MS: 2 * 3600_000,
 
-    DEFAULT_ARM_HOURS: 24,
     HOTKEY: 'p',                // Alt+P toggles the panel
+    WALK_PREV: '[',             // on a profile page, step back through the roster
+    WALK_NEXT: ']',             // ...and forward
     PANEL_W: 560,
     PANEL_MIN_H: 160,
     FAB_SIZE: 42,           // a triangle carries less visual weight than a square of the same box
@@ -110,7 +93,7 @@
   /** @type {Record<string, any>} username -> observed profile */
   let people = readJSON(K.people, {});
   let roster = readJSON(K.roster, { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} });
-  let ui = readJSON(K.ui, { arm: null, sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
+  let ui = readJSON(K.ui, { sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
 
   let saveTimer = null;
   const save = () => {
@@ -124,47 +107,8 @@
   const saveNow = () => { clearTimeout(saveTimer); writeJSON(K.people, people); writeJSON(K.roster, roster); writeJSON(K.ui, ui); };
 
   // ===========================================================================
-  // Arming — persistent, expiring, off by default.
-  //
-  //   __pkpw.arm('dry')        build the queue and report it; send nothing
-  //   __pkpw.arm('live')       originate requests (24h)
-  //   __pkpw.arm('live', 2)    ...for the next 2 hours
-  //   __pkpw.arm('live', 0)    ...with no expiry (discouraged)
-  //   __pkpw.disarm()
-  //
-  // A crawler left armed because someone forgot is a worse failure than one that
-  // needs re-arming, so expiry is the default and disarming is always immediate.
+  // Ingest — every record here came off a response the game made on its own.
   // ===========================================================================
-  const armMode = () => {
-    const a = ui.arm;
-    if (!a) return null;
-    if (a.until && Date.now() > a.until) { ui.arm = null; save(); return null; }
-    return a.mode;
-  };
-  const armState = () => {
-    const m = armMode();
-    return { mode: m || 'off', until: ui.arm?.until || null, requestsThisSession, cap: CFG.MAX_REQUESTS_PER_SESSION };
-  };
-  function arm(mode, hours = CFG.DEFAULT_ARM_HOURS) {
-    if (mode !== 'dry' && mode !== 'live') {
-      throw new Error("arm('dry'|'live', hours?) — 'dry' reports what it would fetch, 'live' fetches");
-    }
-    ui.arm = { mode, until: hours > 0 ? Date.now() + hours * 3600_000 : 0 };
-    saveNow(); paint();
-    if (mode === 'live') pump(); else dryReport();
-    return armState();
-  }
-  function disarm() {
-    ui.arm = null; stopReason = null;
-    saveNow(); paint();
-    return armState();
-  }
-
-  // ===========================================================================
-  // Ingest — one path, whether the response was the app's or ours.
-  // ===========================================================================
-  const inFlightOurs = new Set();
-
   const ingestRosterPage = (url, data) => {
     if (!data || !Array.isArray(data.people)) return;
     const page = Number(data.page) || null;
@@ -191,8 +135,6 @@
 
   const ingestProfile = (url, data) => {
     if (!data || typeof data.username !== 'string' || !('last_online' in data)) return;
-    const via = inFlightOurs.has(url) ? 'backfill' : 'passive';
-    inFlightOurs.delete(url);
     const cur = people[data.username] || {};
     people[data.username] = {
       ...cur,
@@ -207,10 +149,9 @@
       combat: data.combat_record ? { ...data.combat_record } : (cur.combat ?? null),
       relationship: data.relationship ? { ...data.relationship } : (cur.relationship ?? null),
       observedAt: Date.now(),
-      via,
     };
     if (!roster.usernames.includes(data.username)) roster.usernames.push(data.username);
-    log('profile', data.username, `(${via})`);
+    log('profile', data.username);
     save(); paint();
   };
 
@@ -259,167 +200,54 @@
   };
 
   // ===========================================================================
-  // Backfill — the part that originates requests. Armed only.
+  // Roster walk — the manual replacement for a crawler.
+  //
+  // The ledger only ever learns a player from a response the game itself made, so
+  // somebody has to open the profiles. These step you along the roster you have
+  // already enumerated, which turns a walk into one keypress per player instead of
+  // a trip back to the People tab between each one.
+  //
+  // Every step is a navigation you asked for. The app fetches that profile exactly
+  // as it would if you had clicked the player yourself, and nothing here is timed,
+  // queued, or continued while you are looking at something else.
   // ===========================================================================
-  let requestsThisSession = 0;
-  let pumping = false;
-  let stopReason = null;
-  let nextTimer = null;
+  const PROFILE_RE = /^\/profile\/([^/]+)$/;
+  const mod = (n, m) => ((n % m) + m) % m;
 
-  // Jobs that came back 2xx but left no usable record — a shape we didn't expect, a
-  // deleted account, whatever. Without this the queue re-serves the same job forever
-  // and the crawler spins burning requests on it. Session-scoped: a reload retries.
-  const blocked = new Set();
-  const jobId = (j) => (j.kind === 'roster' ? `r:${j.page}` : `p:${j.username}`);
-  const landed = (j) => (j.kind === 'roster'
-    ? !!roster.pages[j.page]
-    : !!people[j.username]?.observedAt);
+  const currentProfile = () => {
+    const m = PROFILE_RE.exec(location.pathname);
+    try { return m ? decodeURIComponent(m[1]) : null; } catch { return m ? m[1] : null; }
+  };
 
-  /** What still needs fetching, most valuable first. */
-  function buildQueue() {
-    const now = Date.now();
-    const jobs = [];
+  /** roster order — the order the game itself paginated them in */
+  const walkOrder = () => roster.usernames;
 
-    // 1. Roster pages we've never seen, or that have gone stale. Without these we
-    //    don't even know who exists, so they come first.
-    const tp = roster.totalPages;
-    if (!tp) {
-      jobs.push({ kind: 'roster', page: 1, why: 'roster never seen' });
-    } else {
-      for (let p = 1; p <= tp; p++) {
-        const seen = roster.pages[p] || 0;
-        if (now - seen > CFG.ROSTER_REFRESH_AFTER_MS) {
-          jobs.push({ kind: 'roster', page: p, why: seen ? 'stale' : 'never seen' });
-        }
-      }
+  const goProfile = (name) => {
+    if (!name) return;
+    history.pushState({}, '', `/profile/${encodeURIComponent(name)}`);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    paint();
+  };
+
+  /** one place along the roster from whoever is on screen; wraps at the ends */
+  const step = (dir) => {
+    const order = walkOrder();
+    if (!order.length) return null;
+    const i = order.indexOf(currentProfile());
+    return i < 0 ? order[0] : order[mod(i + dir, order.length)];
+  };
+
+  /** the next player with no profile yet — the only ones a walk actually gains from */
+  const nextUnseen = (dir = 1) => {
+    const order = walkOrder();
+    if (!order.length) return null;
+    const start = Math.max(0, order.indexOf(currentProfile()));
+    for (let k = 1; k <= order.length; k++) {
+      const cand = order[mod(start + dir * k, order.length)];
+      if (!people[cand]?.observedAt) return cand;
     }
-
-    // 2. Known players with no profile yet.
-    for (const u of roster.usernames) {
-      const r = people[u];
-      if (!r || !r.observedAt) jobs.push({ kind: 'profile', username: u, why: 'never fetched' });
-    }
-
-    // 3. Profiles that have aged out, oldest observation first.
-    const stale = roster.usernames
-      .map((u) => people[u])
-      .filter((r) => r && r.observedAt && now - r.observedAt > CFG.REFRESH_AFTER_MS)
-      .sort((a, b) => a.observedAt - b.observedAt);
-    for (const r of stale) jobs.push({ kind: 'profile', username: r.username, why: 'stale' });
-
-    return jobs.filter((j) => !blocked.has(jobId(j)));
-  }
-
-  const jitter = () => CFG.MIN_GAP_MS + Math.floor(Math.random() * CFG.JITTER_MS);
-
-  /**
-   * What a live run would do, without doing any of it. This is the whole point of
-   * 'dry' — you get to see the size of the thing before firing it at a live account.
-   */
-  function dryReport() {
-    const q = buildQueue();
-    const pages = q.filter((j) => j.kind === 'roster').length;
-    const never = q.filter((j) => j.kind === 'profile' && j.why === 'never fetched').length;
-    const aged = q.filter((j) => j.kind === 'profile' && j.why === 'stale').length;
-    const secs = (q.length * (CFG.MIN_GAP_MS + CFG.JITTER_MS / 2)) / 1000;
-
-    console.group(`${TAG} DRY RUN — nothing sent`);
-    if (!roster.totalPages) {
-      console.warn(
-        'Roster has never been enumerated, so the full sweep size is not knowable yet.\n' +
-        'total/total_pages only arrive with roster page 1. Open the People tab once —\n' +
-        'the passive tap reads it for free — or arm live and let job 1 discover it.',
-      );
-    }
-    console.log(`queued now       ${q.length}`);
-    console.log(`  roster pages   ${pages}`);
-    console.log(`  new profiles   ${never}`);
-    console.log(`  stale refresh  ${aged}`);
-    if (roster.totalPages && roster.total) {
-      console.log(`full sweep       ~${roster.totalPages + roster.total} requests once enumerated`);
-    }
-    console.log(`pacing           ${CFG.MIN_GAP_MS / 1000}s +0-${CFG.JITTER_MS / 1000}s jitter`);
-    console.log(`est. wall clock  ~${Math.max(1, Math.round(secs / 60))} min for what is queued now`);
-    console.log('first 10:', q.slice(0, 10).map((j) =>
-      j.kind === 'roster' ? `GET /api/people?page=${j.page}` : `GET /api/users/${j.username}`));
-    console.groupEnd();
-    return { queued: q.length, rosterPages: pages, newProfiles: never, staleRefresh: aged };
-  }
-
-  async function runOne(job) {
-    const url = job.kind === 'roster'
-      ? `/api/people?page=${job.page}`
-      : `/api/users/${encodeURIComponent(job.username)}`;
-
-    if (armMode() === 'dry') { log('DRY — would GET', url, `(${job.why})`); return { ok: true, dry: true }; }
-
-    requestsThisSession++;
-    inFlightOurs.add(url);
-    try {
-      // same-origin, so the session cookie carries itself; no token is read or replayed
-      const res = await origFetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } });
-      if (!res.ok) return { ok: false, status: res.status };
-      // The tap above does not see origFetch calls, so ingest here directly.
-      const data = await res.json();
-      dispatch(url, data);
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, error: String(e) };
-    } finally {
-      inFlightOurs.delete(url);
-    }
-  }
-
-  async function pump() {
-    if (pumping) return;
-    const mode = armMode();
-    if (!mode) return;
-    pumping = true;
-    stopReason = null;
-
-    try {
-      while (armMode()) {
-        if (CFG.PAUSE_WHEN_HIDDEN && document.hidden) { stopReason = 'paused — tab hidden'; break; }
-        if (requestsThisSession >= CFG.MAX_REQUESTS_PER_SESSION) {
-          stopReason = `session cap reached (${CFG.MAX_REQUESTS_PER_SESSION}) — reload to reset`;
-          break;
-        }
-        const queue = buildQueue();
-        if (!queue.length) { stopReason = 'complete — nothing stale'; break; }
-
-        const job = queue[0];
-        const r = await runOne(job);
-
-        if (!r.ok) {
-          // Do not retry, do not back off and continue. A server saying no is the
-          // signal to stop entirely and let a human look at it.
-          stopReason = `STOPPED on ${job.kind} ${job.username || job.page}: ${r.status || r.error}`;
-          ui.arm = null;
-          saveNow();
-          console.warn(TAG, stopReason);
-          break;
-        }
-
-        if (r.dry) { stopReason = `dry run — ${queue.length} job(s) pending`; break; }
-
-        // 2xx that produced nothing usable: retire the job rather than re-serve it.
-        if (!landed(job)) {
-          blocked.add(jobId(job));
-          log('no usable record from', jobId(job), '— retired for this session');
-        }
-
-        paint();
-        await new Promise((res) => { nextTimer = setTimeout(res, jitter()); });
-      }
-    } finally {
-      pumping = false;
-      paint();
-    }
-  }
-
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && armMode() === 'live') pump();
-  });
+    return null;
+  };
 
   // ===========================================================================
   // Derived metrics
@@ -856,7 +684,6 @@
     panel.style.display = ui.open ? 'flex' : 'none';
     if (!ui.open) return;
 
-    const st = armState();
     const list = rows();
     const known = roster.usernames.length;
     const withProfile = Object.values(people).filter((r) => r.observedAt).length;
@@ -866,22 +693,38 @@
     panel.replaceChildren(grip);
     gripCov.textContent = `${withProfile}/${total} profiled · ${known} known`;
 
-    const bar = document.createElement('div');
-    bar.className = 'bar';
+    // The walk bar, only while you are standing on a profile.
+    const here = currentProfile();
+    if (here) {
+      const order = walkOrder();
+      const idx = order.indexOf(here);
+      const unseen = order.filter((u) => !people[u]?.observedAt).length;
 
-    const hours = document.createElement('select');
-    for (const [l, h] of [['1h', 1], ['8h', 8], ['24h', 24], ['no expiry', 0]]) hours.append(new Option(l, String(h)));
-    hours.value = String(CFG.DEFAULT_ARM_HOURS);
+      const bar = document.createElement('div');
+      bar.className = 'bar';
 
-    for (const [label, mode] of [['off', null], ['dry', 'dry'], ['live', 'live']]) {
-      const b = document.createElement('button');
-      b.textContent = label;
-      if (st.mode === (mode || 'off')) b.className = mode === 'live' ? 'on' : mode === 'dry' ? 'dry' : '';
-      b.onclick = () => { mode ? arm(mode, Number(hours.value)) : disarm(); };
-      bar.append(b);
+      const jump = (label, name, hint) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.title = name ? `${hint} — @${name}` : hint;
+        b.disabled = !name;
+        b.onclick = () => goProfile(name);
+        return b;
+      };
+
+      bar.append(jump(`‹ ${CFG.WALK_PREV}`, step(-1), 'previous player in the roster'));
+      bar.append(jump(`${CFG.WALK_NEXT} ›`, step(1), 'next player in the roster'));
+      bar.append(jump('next unseen ›', nextUnseen(), 'skip ahead to a player with no profile yet'));
+
+      const where = document.createElement('span');
+      where.className = 'dim';
+      where.textContent = idx >= 0
+        ? `${idx + 1}/${order.length} · ${unseen} unseen`
+        : `@${here} is not in the roster yet · ${unseen} unseen`;
+      bar.append(where);
+
+      panel.append(bar);
     }
-    bar.append(hours);
-    panel.append(bar);
 
     const bar2 = document.createElement('div');
     bar2.className = 'bar';
@@ -941,10 +784,9 @@
 
     const note = document.createElement('div');
     note.className = 'note';
-    const pend = buildQueue().length;
-    note.textContent = st.mode === 'off'
-      ? `disarmed · ${pend} job(s) would run · ◦ = never stuck`
-      : `${st.mode} · ${st.requestsThisSession}/${st.cap} reqs · ${pend} pending${stopReason ? ' · ' + stopReason : ''}`;
+    const unseen = roster.usernames.filter((u) => !people[u]?.observedAt).length;
+    note.textContent = `passive · ${unseen} known player(s) still unprofiled`
+      + ` · open one to record it · ◦ = never stuck`;
     panel.append(note);
 
     // the rows just changed the height, so re-place and re-check it is still reachable
@@ -954,22 +796,32 @@
   // ===========================================================================
   // Boot
   // ===========================================================================
+  const typing = (el) => !!el && (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable);
+
   const boot = () => {
     mount();
     window.addEventListener('keydown', (e) => {
-      if (e.altKey && e.key.toLowerCase() === CFG.HOTKEY) { ui.open = !ui.open; save(); paint(); }
+      if (e.altKey && e.key.toLowerCase() === CFG.HOTKEY) { ui.open = !ui.open; save(); paint(); return; }
+      // walk keys work whether or not the panel is open, but never while you are
+      // typing — the game has a chat box and swallowing a bracket would be rude
+      if (e.altKey || e.ctrlKey || e.metaKey || typing(e.target) || !currentProfile()) return;
+      if (e.key === CFG.WALK_PREV) { e.preventDefault(); goProfile(step(-1)); }
+      else if (e.key === CFG.WALK_NEXT) { e.preventDefault(); goProfile(step(1)); }
     });
-    if (armMode() === 'live') pump();
-    log('ready —', armState().mode, '·', roster.usernames.length, 'known');
+    // the walk bar only exists on profile routes, so repaint when the route moves
+    for (const m of ['pushState', 'replaceState']) {
+      const orig = history[m];
+      history[m] = function (...a) { const r = orig.apply(this, a); queueMicrotask(paint); return r; };
+    }
+    window.addEventListener('popstate', () => queueMicrotask(paint));
+    log('ready — passive ·', roster.usernames.length, 'known');
   };
 
   window.__pkpw = {
-    arm, disarm, state: armState, dryReport,
     people: () => people,
     roster: () => roster,
-    queue: () => buildQueue(),
     rows,
-    stop: () => { clearTimeout(nextTimer); ui.arm = null; saveNow(); paint(); return 'stopped'; },
+    unseen: () => roster.usernames.filter((u) => !people[u]?.observedAt),
     resetFab: () => { ui.fab = defaultFabPos(); saveNow(); placeFab(); return ui.fab; },
     clear: () => { people = {}; roster = { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} }; saveNow(); paint(); return 'cleared'; },
     export: () => JSON.stringify({ people, roster }, null, 2),

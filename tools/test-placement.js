@@ -44,9 +44,11 @@ console.log('\n— default position —');
   const s = mkStage(1600, 900);
   const d = s.defaultFabPos();
   check('sits on the right edge', d.x, 1600 - CFG.FAB_SIZE - CFG.EDGE);
-  check('sits at mid-height, not in a corner', d.y, Math.round((900 - CFG.FAB_SIZE) / 2));
-  // The whole point of the move: the bottom-right corner belongs to the chat.
-  check('leaves the bottom of the viewport clear', d.y + CFG.FAB_SIZE < 900 - 200, true);
+  check('sits in the upper third, not in a corner', d.y, Math.round(900 * 0.28));
+  // The whole point of the height: the Comms dock is 420px tall and anchored to the
+  // bottom of this same edge, so mid-height lands on top of it on a short window.
+  check('clears a 420px dock on a 900px window', d.y + CFG.FAB_SIZE < 900 - 420, true);
+  check('...and on a 720px one', Math.round(720 * 0.28) + CFG.FAB_SIZE < 720 - 420, true);
 }
 
 console.log('\n— clamping —');
