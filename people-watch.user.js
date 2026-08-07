@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Politiko — People Watch
 // @namespace    https://github.com/dataterminals/politiko-people-watch
-// @version      0.1.1
+// @version      0.2.0
 // @description  Builds a local ledger of players' last-online times, ranks and combat records, and sorts it least-active-first. Reads profiles the app fetches on its own; when explicitly armed, ORIGINATES paced requests to /api/people and /api/users/{name} to fill the gaps.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/politiko-people-watch
@@ -105,7 +105,7 @@
   /** @type {Record<string, any>} username -> observed profile */
   let people = readJSON(K.people, {});
   let roster = readJSON(K.roster, { total: null, totalPages: null, usernames: [], seenAt: 0, pages: {} });
-  let ui = readJSON(K.ui, { arm: null, sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null });
+  let ui = readJSON(K.ui, { arm: null, sort: 'idle', hideOnline: false, hideNpc: true, minIdleDays: 0, open: false, fab: null, panel: null });
 
   let saveTimer = null;
   const save = () => {
@@ -473,6 +473,118 @@
   // Panel
   // ===========================================================================
   let host = null, root = null, fab = null;
+  let grip = null, gripCov = null, panelDrag = null;
+
+  // ===========================================================================
+  // PANEL KIT v1 — shared verbatim block.
+  //
+  //    Repo convention: every panel we ship is draggable and remembers where you
+  //    put it. Copy this block into a new tool exactly as it stands. If you have
+  //    to change it, bump the version in this header and in every tool carrying
+  //    a copy, so the copies can be diffed. No build step, no @require, so each
+  //    script stays a single auditable file (clause 6).
+  //
+  //    draggable(node, handle, onMove) -> { apply(pos), reset(), dragged() }
+  //      node    the element that moves (must be position: fixed)
+  //      handle  the grab area; buttons/inputs inside it stay clickable, unless
+  //              the handle IS the control (a bare FAB drags from itself)
+  //      onMove  called with {x, y} in viewport px, or null when reset
+  //      dragged() is true if the last gesture actually moved — check it in a
+  //              click handler so dragging a FAB doesn't also toggle it
+  // ===========================================================================
+  const draggable = (node, handle, onMove) => {
+    const EDGE = 44; // px of the element that must stay reachable on screen
+    let sx = 0, sy = 0, ox = 0, oy = 0, live = false, moved = false;
+    let skew = null; // gap between the border box and what left/top actually set
+
+    const place = (x, y) => {
+      const w = node.offsetWidth, h = node.offsetHeight;
+      const p = w && h ? {
+        x: Math.min(Math.max(x, EDGE - w), window.innerWidth - EDGE),
+        y: Math.min(Math.max(y, 0), window.innerHeight - Math.min(EDGE, h)),
+      } : { x, y }; // hidden element: no geometry to clamp against, fix it on show
+      node.style.left = `${p.x}px`;
+      node.style.top = `${p.y}px`;
+      node.style.right = 'auto';
+      node.style.bottom = 'auto';
+      // `left` positions the MARGIN edge, but every measurement here is the
+      // border box. If the host page styles our element with a margin, each grab
+      // drifts by that much and compounds. Measure the gap once, then cancel it.
+      if (skew === null && w && h) {
+        const seen = node.getBoundingClientRect();
+        skew = { x: seen.left - p.x, y: seen.top - p.y };
+      }
+      if (skew && (skew.x || skew.y)) {
+        node.style.left = `${p.x - skew.x}px`;
+        node.style.top = `${p.y - skew.y}px`;
+      }
+      return p;
+    };
+
+    const down = (ev) => {
+      if (ev.button != null && ev.button !== 0) return;
+      // a control inside the handle keeps its click; the handle itself still drags
+      if (ev.target !== handle && ev.target.closest?.('button,input,select,textarea,a,[data-nodrag]')) return;
+      const r = node.getBoundingClientRect();
+      place(r.left, r.top); // convert whatever CSS anchoring it had into left/top
+      sx = ev.clientX; sy = ev.clientY; ox = r.left; oy = r.top;
+      live = true; moved = false;
+      try { handle.setPointerCapture(ev.pointerId); } catch { /* capture is a nicety */ }
+      ev.preventDefault();
+    };
+
+    const move = (ev) => {
+      if (!live) return;
+      const dx = ev.clientX - sx, dy = ev.clientY - sy;
+      if (!moved && Math.hypot(dx, dy) < 4) return; // tremor isn't a drag
+      moved = true;
+      place(ox + dx, oy + dy);
+    };
+
+    const up = (ev) => {
+      if (!live) return;
+      live = false;
+      try { handle.releasePointerCapture(ev.pointerId); } catch { /* already gone */ }
+      if (!moved) return;
+      const r = node.getBoundingClientRect();
+      onMove({ x: r.left, y: r.top });
+    };
+
+    handle.style.touchAction = 'none'; // don't scroll the game while dragging
+    handle.style.cursor = 'grab';
+    handle.addEventListener('pointerdown', down);
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+
+    // Never strand the panel: a short window, a rotation, or a panel that grew
+    // taller than the space its CSS corner left it can all put the drag handle
+    // off-screen, and then there is no way to get it back.
+    const fit = () => {
+      const r = node.getBoundingClientRect();
+      if (!r.width || !r.height) return false;
+      const x = Math.min(Math.max(r.left, EDGE - r.width), window.innerWidth - EDGE);
+      const y = Math.min(Math.max(r.top, 0), window.innerHeight - Math.min(EDGE, r.height));
+      if (Math.abs(x - r.left) < 0.5 && Math.abs(y - r.top) < 0.5) return false;
+      onMove(place(x, y));
+      return true;
+    };
+    window.addEventListener('resize', fit);
+
+    return {
+      apply: (pos) => {
+        if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return false;
+        place(pos.x, pos.y);
+        return true;
+      },
+      reset: () => {
+        node.style.left = node.style.top = node.style.right = node.style.bottom = '';
+        onMove(null);
+      },
+      dragged: () => moved,
+      fit, // call after mounting and after any render that changes the size
+    };
+  };
 
   const css = `
     :host { all: initial; }
@@ -499,9 +611,24 @@
     .note { padding: 6px 8px; color: #a1a1aa; border-top: 1px solid #27272a; font-size: 11px; }
     .fab { position: fixed; z-index: 2147483000; width: ${CFG.FAB_SIZE}px; height: ${CFG.FAB_SIZE}px;
       background: #09090b; border: 1px solid #3f3f46; color: #e4e4e7; font-size: 11px;
-      cursor: grab; touch-action: none; }
+      cursor: grab; touch-action: none; padding: 0;
+      display: flex; align-items: center; justify-content: center; }
+    .fab svg { width: 22px; height: 22px; display: block; }
     .fab.dragging { cursor: grabbing; border-color: #71717a; }
+    .grip { display: flex; gap: 8px; align-items: baseline; padding: 6px 8px;
+      border-bottom: 1px solid #27272a; user-select: none; }
+    .grip b { font-weight: 600; letter-spacing: .04em; }
+    .grip .cov { margin-left: auto; }
   `;
+
+  // The eye of providence: a triangle, a lens, a pupil. Drawn rather than typed so it
+  // stays legible at 22px — glyph fallbacks for this are a lottery across platforms.
+  const EYE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M12 2.6 22 20.4 2 20.4 Z"/>
+      <path d="M6.9 14.6c1.6-2.7 8.6-2.7 10.2 0-1.6 2.7-8.6 2.7-10.2 0Z"/>
+      <circle cx="12" cy="14.6" r="1.5" fill="currentColor" stroke="none"/>
+    </svg>`;
 
   function mount() {
     if (host) return;
@@ -515,13 +642,28 @@
 
     fab = document.createElement('button');
     fab.className = 'fab';
-    fab.textContent = 'PPL';
+    fab.innerHTML = EYE_SVG;
+    fab.setAttribute('aria-label', 'People Watch');
     fab.title = 'People Watch — click to open, drag to move, double-click to reset';
     root.append(fab);
 
     const panel = document.createElement('div');
     panel.className = 'panel';
+
+    // The drag handle has to outlive paint(), which rebuilds everything below it.
+    grip = document.createElement('div');
+    grip.className = 'grip';
+    grip.title = 'Drag to move · double-click to re-tether to the button';
+    gripCov = document.createElement('span');
+    gripCov.className = 'dim cov';
+    grip.append(Object.assign(document.createElement('b'), { textContent: 'PEOPLE WATCH' }), gripCov);
+    panel.append(grip);
+
     root.append(panel);
+
+    // Park it where you like; until you do, it stays tethered to the button.
+    panelDrag = draggable(panel, grip, (pos) => { ui.panel = pos; saveNow(); if (!pos) placePanel(); });
+    grip.addEventListener('dblclick', () => panelDrag.reset());
 
     placeFab();
     makeDraggable();
@@ -574,6 +716,19 @@
     const vw = window.innerWidth, vh = window.innerHeight;
     const w = Math.min(CFG.PANEL_W, vw - CFG.EDGE * 2);
     panel.style.width = `${w}px`;
+
+    // Parked by hand: the panel keeps its own spot and stops following the button.
+    // Height is capped to whatever is left below it so the table scrolls instead of
+    // running off the bottom. Double-click the header to hand it back to the tether.
+    if (ui.panel) {
+      panel.style.left = `${ui.panel.x}px`;
+      panel.style.top = `${ui.panel.y}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.style.maxHeight = `${Math.max(CFG.PANEL_MIN_H, vh - ui.panel.y - CFG.EDGE)}px`;
+      panelDrag?.fit();
+      return;
+    }
 
     // Horizontal: whichever edge of the button leaves the panel fully on screen,
     // preferring right-aligned so it opens inward from the right.
@@ -660,20 +815,12 @@
     const withProfile = Object.values(people).filter((r) => r.observedAt).length;
     const total = roster.total ?? '?';
 
-    panel.replaceChildren();
+    // keep the grip: it carries the drag listeners, everything below it is disposable
+    panel.replaceChildren(grip);
+    gripCov.textContent = `${withProfile}/${total} profiled · ${known} known`;
 
     const bar = document.createElement('div');
     bar.className = 'bar';
-    const title = document.createElement('b');
-    title.textContent = 'PEOPLE WATCH';
-    bar.append(title);
-
-    const cov = document.createElement('span');
-    cov.className = 'dim';
-    cov.textContent = `${withProfile}/${total} profiled · ${known} known`;
-    bar.append(cov);
-
-    bar.append(Object.assign(document.createElement('span'), { className: 'spacer' }));
 
     const hours = document.createElement('select');
     for (const [l, h] of [['1h', 1], ['8h', 8], ['24h', 24], ['no expiry', 0]]) hours.append(new Option(l, String(h)));
@@ -751,6 +898,9 @@
       ? `disarmed · ${pend} job(s) would run · ◦ = never stuck`
       : `${st.mode} · ${st.requestsThisSession}/${st.cap} reqs · ${pend} pending${stopReason ? ' · ' + stopReason : ''}`;
     panel.append(note);
+
+    // the rows just changed the height, so re-place and re-check it is still reachable
+    placePanel();
   }
 
   // ===========================================================================
